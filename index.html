@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BarberNet</title>
+<meta name="description" content="Agende seu horário na barbearia em poucos cliques.">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<nav class="nav">
+  <div class="container">
+    <div class="brand" id="brandName">Barber<small>NET</small></div>
+    <ul class="nav-links" id="navLinks">
+      <li><a href="#servicos">Serviços</a></li>
+      <li><a href="#horarios">Horários</a></li>
+      <li><a href="#agendar">Agendar</a></li>
+      <li><a href="#contato">Contato</a></li>
+    </ul>
+    <button class="nav-toggle" id="navToggle" aria-label="Abrir menu">☰</button>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="container hero-grid">
+    <div>
+      <div class="eyebrow">Agendamento online</div>
+      <h1 id="heroTitle">Seu corte, <em>sem espera</em>.</h1>
+      <p class="lede" id="heroLede">Veja os horários livres em tempo real e garanta seu lugar na cadeira sem precisar ligar.</p>
+      <div class="hero-actions">
+        <a href="#agendar" class="btn btn-primary">Agendar horário</a>
+        <a href="#servicos" class="btn btn-ghost">Ver serviços</a>
+      </div>
+      <div class="hero-status">
+        <span class="status-dot" id="statusDot"></span>
+        <span id="statusText">Consultando horário de funcionamento…</span>
+      </div>
+    </div>
+
+    <div class="hero-card">
+      <div class="hero-card-head">
+        <span>Próximas vagas</span>
+        <span id="heroCardDate">hoje</span>
+      </div>
+      <div class="slot-ledger" id="heroSlots">
+        <div class="slot-row"><span class="skeleton" style="width:60%;height:14px"></span></div>
+        <div class="slot-row"><span class="skeleton" style="width:50%;height:14px"></span></div>
+        <div class="slot-row"><span class="skeleton" style="width:70%;height:14px"></span></div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<div class="pole-divider"></div>
+
+<section id="servicos">
+  <div class="container">
+    <div class="section-head">
+      <div class="eyebrow">Cardápio</div>
+      <h2>Serviços</h2>
+      <p>Preços e duração de cada atendimento, atualizados diretamente pelo barbeiro.</p>
+    </div>
+    <div class="services-grid" id="servicesGrid">
+      <div class="service-card"><div class="skeleton" style="height:60px"></div></div>
+      <div class="service-card"><div class="skeleton" style="height:60px"></div></div>
+      <div class="service-card"><div class="skeleton" style="height:60px"></div></div>
+    </div>
+  </div>
+</section>
+
+<section id="horarios">
+  <div class="container">
+    <div class="section-head">
+      <div class="eyebrow">Funcionamento</div>
+      <h2>Horários</h2>
+      <p>Confira os dias e horários de atendimento. Feriados e ajustes pontuais aparecem aqui automaticamente.</p>
+    </div>
+    <table class="hours-table" id="hoursTable">
+      <tbody></tbody>
+    </table>
+    <div id="exceptionNote"></div>
+  </div>
+</section>
+
+<div class="pole-divider"></div>
+
+<section id="agendar">
+  <div class="container">
+    <div class="section-head">
+      <div class="eyebrow">Reserva</div>
+      <h2>Agendar horário</h2>
+      <p>Escolha o serviço, a data e um horário livre. A confirmação é automática.</p>
+    </div>
+
+    <div class="booking-box">
+      <div class="steps">
+        <div class="step active" data-step="1"><span class="num">1</span> Serviço</div>
+        <div class="step" data-step="2"><span class="num">2</span> Data e horário</div>
+        <div class="step" data-step="3"><span class="num">3</span> Seus dados</div>
+      </div>
+
+      <!-- Etapa 1 -->
+      <div class="booking-step" id="step1">
+        <label class="field-label">Escolha o serviço</label>
+        <div class="service-pick-grid" id="servicePickGrid"></div>
+      </div>
+
+      <!-- Etapa 2 -->
+      <div class="booking-step" id="step2" style="display:none">
+        <div class="form-group">
+          <label class="field-label" for="dateInput">Escolha a data</label>
+          <input type="date" id="dateInput">
+          <div class="field-hint" id="dateHint"></div>
+        </div>
+        <div id="slotsWrap">
+          <label class="field-label">Horários livres</label>
+          <div class="slots-grid" id="slotsGrid"></div>
+        </div>
+        <div style="margin-top:20px;display:flex;gap:12px">
+          <button class="btn btn-ghost" data-back="1">Voltar</button>
+          <button class="btn btn-primary" id="toStep3" disabled>Continuar</button>
+        </div>
+      </div>
+
+      <!-- Etapa 3 -->
+      <div class="booking-step" id="step3" style="display:none">
+        <div class="form-row">
+          <div class="form-group">
+            <label class="field-label" for="clientName">Nome</label>
+            <input type="text" id="clientName" placeholder="Seu nome completo" autocomplete="name">
+          </div>
+          <div class="form-group">
+            <label class="field-label" for="clientPhone">WhatsApp / telefone</label>
+            <input type="tel" id="clientPhone" placeholder="(00) 00000-0000" autocomplete="tel">
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="field-label" for="clientNote">Observação (opcional)</label>
+          <textarea id="clientNote" placeholder="Alguma preferência para o atendimento?"></textarea>
+        </div>
+        <div style="display:flex;gap:12px">
+          <button class="btn btn-ghost" data-back="2">Voltar</button>
+          <button class="btn btn-primary" id="confirmBooking">Confirmar agendamento</button>
+        </div>
+        <div id="bookingResult"></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="contato">
+  <div class="container">
+    <div class="section-head">
+      <div class="eyebrow">Fale com a gente</div>
+      <h2>Contato</h2>
+      <p>Prefere combinar direto? Use um dos canais abaixo.</p>
+    </div>
+    <div class="contact-grid" id="contactGrid"></div>
+  </div>
+</section>
+
+<footer>
+  <div class="container" style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px;width:100%">
+    <span id="footerBrand">BarberNet</span>
+    <span>Powered by <a href="admin.html">BarberNet</a></span>
+  </div>
+</footer>
+
+<script src="js/config.js"></script>
+<script src="js/site.js"></script>
+</body>
+</html>

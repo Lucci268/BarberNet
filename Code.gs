@@ -1,0 +1,508 @@
+/* ============================================================
+   BarberNet — Backend (Google Apps Script)
+   ------------------------------------------------------------
+   Este script transforma uma Planilha Google em banco de dados
+   e usa o Google Calendar para os agendamentos.
+
+   COMO USAR — resumo (veja o GUIA-DE-CONFIGURACAO.md completo):
+   1) Cole este arquivo em Extensões > Apps Script de uma planilha
+      nova.
+   2) Rode a função setup() uma vez (menu ▶ ao lado de "setup").
+   3) Implantar > Nova implantação > Aplicativo da Web
+      - Executar como: Eu
+      - Quem pode acessar: Qualquer pessoa
+   4) Copie a URL gerada para js/config.js (site) e para a tela
+      de login do admin.html.
+   ============================================================ */
+
+const SHEET_CONFIG      = 'Config';
+const SHEET_SERVICES    = 'Servicos';
+const SHEET_HOURS       = 'Horarios';
+const SHEET_EXCEPTIONS  = 'Excecoes';
+const SHEET_BOOKINGS    = 'Agendamentos';
+
+const SLOT_STEP_MINUTES = 30; // granularidade dos horários oferecidos
+
+/* ============================================================
+   SETUP — rode uma única vez pelo editor do Apps Script
+   ============================================================ */
+function setup(){
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  ensureSheet_(ss, SHEET_CONFIG, ['chave','valor']);
+  ensureSheet_(ss, SHEET_SERVICES, ['id','nome','preco','duracao','ativo']);
+  ensureSheet_(ss, SHEET_HOURS, ['diaSemana','ativo','abre','fecha']);
+  ensureSheet_(ss, SHEET_EXCEPTIONS, ['id','data','tipo','abre','fecha','nota']);
+  ensureSheet_(ss, SHEET_BOOKINGS, ['id','data','hora','duracao','servicoId','servicoNome','nome','telefone','nota','status','eventoId','criadoEm']);
+
+  // Config padrão (só cria se ainda não existir)
+  const cfg = getConfigSheet_();
+  const existing = readConfig_();
+  const defaults = {
+    name: existing.name || 'BarberNet',
+    tagline: existing.tagline || 'Seu corte, <em>sem espera</em>.',
+    lede: existing.lede || 'Veja os horários livres em tempo real e garanta seu lugar na cadeira.',
+    whatsapp: existing.whatsapp || '',
+    phone: existing.phone || '',
+    instagram: existing.instagram || '',
+    address: existing.address || '',
+    mapLink: existing.mapLink || '',
+    password: existing.password || Utilities.getUuid().slice(0,8),
+    slotStepMinutes: existing.slotStepMinutes || String(SLOT_STEP_MINUTES),
+  };
+
+  // Cria a agenda dedicada, se ainda não existe
+  let calendarId = existing.calendarId;
+  if(!calendarId){
+    const cal = CalendarApp.createCalendar(`${defaults.name} — Agendamentos`);
+    calendarId = cal.getId();
+  }
+  defaults.calendarId = calendarId;
+
+  Object.keys(defaults).forEach(k => setConfigValue_(k, defaults[k]));
+
+  // Horários padrão: seg–sáb, 09:00–19:00 (só preenche se a aba estiver vazia)
+  const hoursSheet = ss.getSheetByName(SHEET_HOURS);
+  if(hoursSheet.getLastRow() < 2){
+    const rows = [];
+    for(let d=0; d<7; d++){
+      const active = d !== 0; // fechado aos domingos por padrão
+      rows.push([d, active, '09:00', '19:00']);
+    }
+    hoursSheet.getRange(2,1,rows.length,4).setValues(rows);
+  }
+
+  Logger.log('Setup concluído. Senha do painel: ' + defaults.password);
+  Logger.log('Guarde essa senha — ela também fica na aba "Config".');
+}
+
+function ensureSheet_(ss, name, headers){
+  let sheet = ss.getSheetByName(name);
+  if(!sheet){
+    sheet = ss.insertSheet(name);
+  }
+  if(sheet.getLastRow() === 0){
+    sheet.getRange(1,1,1,headers.length).setValues([headers]);
+    sheet.setFrozenRows(1);
+  }
+  return sheet;
+}
+
+/* ============================================================
+   ROTEAMENTO HTTP
+   ============================================================ */
+function doGet(e){
+  try{
+    const action = e.parameter.action;
+    let result;
+    switch(action){
+      case 'getPublicData': result = getPublicData_(); break;
+      case 'getAvailability': result = getAvailability_(e.parameter.date, e.parameter.serviceId); break;
+      case 'getAdminData': requireAuth_(e); result = getAdminData_(); break;
+      case 'getBookings': requireAuth_(e); result = { bookings: listBookings_() }; break;
+      default: result = { error: 'AÇÃO_DESCONHECIDA' };
+    }
+    return jsonOutput_(result);
+  }catch(err){
+    return jsonOutput_({ error: String(err.message || err) });
+  }
+}
+
+function doPost(e){
+  try{
+    const action = e.parameter.action;
+    const body = JSON.parse(e.postData.contents || '{}');
+    let result;
+    switch(action){
+      case 'createBooking': result = createBooking_(body); break;
+      case 'saveInfo': requireAuth_(e); result = saveInfo_(body); break;
+      case 'addService': requireAuth_(e); result = addService_(body); break;
+      case 'removeService': requireAuth_(e); result = removeService_(e.parameter.id); break;
+      case 'saveHours': requireAuth_(e); result = saveHours_(body); break;
+      case 'addException': requireAuth_(e); result = addException_(body); break;
+      case 'removeException': requireAuth_(e); result = removeException_(e.parameter.id); break;
+      case 'cancelBooking': requireAuth_(e); result = cancelBooking_(e.parameter.id); break;
+      default: result = { error: 'AÇÃO_DESCONHECIDA' };
+    }
+    return jsonOutput_(result);
+  }catch(err){
+    return jsonOutput_({ error: String(err.message || err) });
+  }
+}
+
+function jsonOutput_(obj){
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}
+
+function requireAuth_(e){
+  const cfg = readConfig_();
+  if(!e.parameter.pass || e.parameter.pass !== cfg.password){
+    throw new Error('SENHA_INVALIDA');
+  }
+}
+
+/* ============================================================
+   CONFIG (chave/valor)
+   ============================================================ */
+function getConfigSheet_(){
+  return SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_CONFIG);
+}
+function readConfig_(){
+  const sheet = getConfigSheet_();
+  if(!sheet) return {};
+  const rows = sheet.getDataRange().getValues().slice(1);
+  const cfg = {};
+  rows.forEach(([k,v]) => { if(k) cfg[k] = v; });
+  return cfg;
+}
+function setConfigValue_(key, value){
+  const sheet = getConfigSheet_();
+  const rows = sheet.getDataRange().getValues();
+  for(let i=1;i<rows.length;i++){
+    if(rows[i][0] === key){
+      sheet.getRange(i+1,2).setValue(value);
+      return;
+    }
+  }
+  sheet.appendRow([key, value]);
+}
+
+/* ============================================================
+   SERVIÇOS
+   ============================================================ */
+function listServices_(){
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_SERVICES);
+  const rows = sheet.getDataRange().getValues().slice(1);
+  return rows.filter(r => r[0]).map(r => ({
+    id: r[0], name: r[1], price: r[2], duration: Number(r[3]), active: r[4] !== false,
+  }));
+}
+function addService_(body){
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_SERVICES);
+  const id = Utilities.getUuid();
+  sheet.appendRow([id, body.name, Number(body.price), Number(body.duration), true]);
+  return { ok:true, id };
+}
+function removeService_(id){
+  deleteRowById_(SHEET_SERVICES, id);
+  return { ok:true };
+}
+
+/* ============================================================
+   HORÁRIOS
+   ============================================================ */
+function listHours_(){
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_HOURS);
+  const rows = sheet.getDataRange().getValues().slice(1);
+  return rows.map(r => ({ weekday:Number(r[0]), active:r[1]===true, open:r[2], close:r[3] }));
+}
+function saveHours_(body){
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_HOURS);
+  sheet.getRange(2,1,sheet.getLastRow()-1,4).clearContent();
+  const rows = body.hours.map(h => [h.weekday, h.active, h.open, h.close]);
+  sheet.getRange(2,1,rows.length,4).setValues(rows);
+  return { ok:true };
+}
+
+/* ============================================================
+   EXCEÇÕES (feriados / horário especial)
+   ============================================================ */
+function listExceptions_(){
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_EXCEPTIONS);
+  const rows = sheet.getDataRange().getValues().slice(1);
+  return rows.filter(r => r[0]).map(r => ({
+    id:r[0], date:formatDate_(r[1]), type:r[2], open:r[3], close:r[4], note:r[5],
+  }));
+}
+function addException_(body){
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_EXCEPTIONS);
+  const id = Utilities.getUuid();
+  sheet.appendRow([id, body.date, body.type, body.open || '', body.close || '', body.note || '']);
+  return { ok:true, id };
+}
+function removeException_(id){
+  deleteRowById_(SHEET_EXCEPTIONS, id);
+  return { ok:true };
+}
+
+/* ============================================================
+   AGENDAMENTOS
+   ============================================================ */
+function listBookings_(){
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_BOOKINGS);
+  const rows = sheet.getDataRange().getValues().slice(1);
+  return rows.filter(r => r[0] && r[9] !== 'cancelado')
+    .map(r => ({
+      id:r[0], date:formatDate_(r[1]), time:r[2], duration:r[3],
+      serviceId:r[4], serviceName:r[5], name:r[6], phone:r[7], note:r[8], status:r[9],
+    }))
+    .sort((a,b) => (a.date+a.time).localeCompare(b.date+b.time));
+}
+
+function createBooking_(body){
+  const { serviceId, date, time, name, phone, note } = body;
+  if(!serviceId || !date || !time || !name || !phone){
+    return { error: 'DADOS_INCOMPLETOS' };
+  }
+  const services = listServices_();
+  const service = services.find(s => s.id === serviceId);
+  if(!service) return { error: 'SERVICO_NAO_ENCONTRADO' };
+
+  // Revalida disponibilidade no momento da confirmação (evita choque de horário)
+  const avail = getAvailability_(date, serviceId);
+  if(avail.closed || !(avail.slots || []).includes(time)){
+    return { error: 'HORARIO_INDISPONIVEL' };
+  }
+
+  const cfg = readConfig_();
+  const start = new Date(`${date}T${time}:00`);
+  const end = new Date(start.getTime() + service.duration * 60000);
+
+  let eventId = '';
+  try{
+    const cal = CalendarApp.getCalendarById(cfg.calendarId);
+    const event = cal.createEvent(`${service.name} — ${name}`, start, end, {
+      description: `Cliente: ${name}\nTelefone: ${phone}\nObservação: ${note || '-'}`,
+    });
+    eventId = event.getId();
+  }catch(err){
+    // segue mesmo se a agenda falhar — o agendamento na planilha é a fonte da verdade
+  }
+
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_BOOKINGS);
+  const id = Utilities.getUuid();
+  sheet.appendRow([id, date, time, service.duration, service.id, service.name, name, phone, note || '', 'confirmado', eventId, new Date()]);
+  return { ok:true, id };
+}
+
+function cancelBooking_(id){
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_BOOKINGS);
+  const rows = sheet.getDataRange().getValues();
+  for(let i=1;i<rows.length;i++){
+    if(rows[i][0] === id){
+      sheet.getRange(i+1,10).setValue('cancelado');
+      const eventId = rows[i][10];
+      if(eventId){
+        try{
+          const cfg = readConfig_();
+          const cal = CalendarApp.getCalendarById(cfg.calendarId);
+          cal.getEventById(eventId).deleteEvent();
+        }catch(err){ /* evento pode já não existir */ }
+      }
+      return { ok:true };
+    }
+  }
+  return { error: 'AGENDAMENTO_NAO_ENCONTRADO' };
+}
+
+/* ============================================================
+   DISPONIBILIDADE
+   ============================================================ */
+function getAvailability_(dateStr, serviceId){
+  if(!dateStr) return { error:'DATA_OBRIGATORIA' };
+  const services = listServices_();
+  const service = services.find(s => s.id === serviceId) || { duration: SLOT_STEP_MINUTES };
+  const duration = service.duration;
+
+  const date = new Date(`${dateStr}T00:00:00`);
+  const weekday = date.getDay();
+
+  const exceptions = listExceptions_();
+  const exception = exceptions.find(e => e.date === dateStr);
+
+  let open, close, closedReason = null;
+  if(exception){
+    if(exception.type === 'closed'){
+      closedReason = exception.note || 'Fechado nesta data';
+    }else{
+      open = exception.open; close = exception.close;
+    }
+  }else{
+    const hours = listHours_().find(h => h.weekday === weekday);
+    if(!hours || !hours.active){
+      closedReason = 'Fechado neste dia da semana';
+    }else{
+      open = hours.open; close = hours.close;
+    }
+  }
+
+  if(closedReason){
+    return { closed:true, reason:closedReason };
+  }
+
+  const candidates = buildSlotCandidates_(dateStr, open, close, duration);
+  const busy = getBusyRanges_(dateStr);
+  const now = new Date();
+
+  const free = candidates.filter(slot => {
+    if(slot.start < now) return false; // não oferece horário que já passou
+    return !busy.some(b => slot.start < b.end && slot.end > b.start);
+  }).map(s => s.label);
+
+  return { slots: free };
+}
+
+function buildSlotCandidates_(dateStr, open, close, duration){
+  const [oh, om] = open.split(':').map(Number);
+  const [ch, cm] = close.split(':').map(Number);
+  const dayStart = new Date(`${dateStr}T00:00:00`);
+  const openTime = new Date(dayStart); openTime.setHours(oh, om, 0, 0);
+  const closeTime = new Date(dayStart); closeTime.setHours(ch, cm, 0, 0);
+
+  const slots = [];
+  let cursor = new Date(openTime);
+  while(true){
+    const end = new Date(cursor.getTime() + duration*60000);
+    if(end > closeTime) break;
+    slots.push({ start:new Date(cursor), end, label: Utilities.formatDate(cursor, Session.getScriptTimeZone(), 'HH:mm') });
+    cursor = new Date(cursor.getTime() + SLOT_STEP_MINUTES*60000);
+  }
+  return slots;
+}
+
+function getBusyRanges_(dateStr){
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_BOOKINGS);
+  const rows = sheet.getDataRange().getValues().slice(1);
+  return rows
+    .filter(r => r[0] && r[1] && r[9] !== 'cancelado' && formatDate_(r[1]) === dateStr)
+    .map(r => {
+      const start = new Date(`${formatDate_(r[1])}T${r[2]}:00`);
+      const end = new Date(start.getTime() + Number(r[3])*60000);
+      return { start, end };
+    });
+}
+
+/* ============================================================
+   DADOS PÚBLICOS / ADMIN
+   ============================================================ */
+function getPublicData_(){
+  const cfg = readConfig_();
+  const services = listServices_();
+  const hours = listHours_();
+  const exceptions = listExceptions_()
+    .filter(e => e.date >= todayISO_())
+    .slice(0,5)
+    .map(e => ({ ...e, dateLabel: formatDateLabel_(e.date) }));
+
+  const status = computeOpenStatus_(hours, listExceptions_());
+  const nextSlots = computeNextSlots_(services, hours);
+
+  return {
+    name: cfg.name, tagline: cfg.tagline, lede: cfg.lede,
+    whatsapp: cfg.whatsapp, phone: cfg.phone, instagram: cfg.instagram,
+    address: cfg.address, mapLink: cfg.mapLink,
+    services, hours, exceptions,
+    openNow: status.openNow, closesAt: status.closesAt, opensAt: status.opensAt, opensAtLabel: status.opensAtLabel,
+    nextSlots: nextSlots.slots, nextSlotsDateLabel: nextSlots.dateLabel,
+  };
+}
+
+function getAdminData_(){
+  const cfg = readConfig_();
+  let sheetsOk = true, calendarOk = true;
+  try{ SpreadsheetApp.getActiveSpreadsheet(); }catch(e){ sheetsOk = false; }
+  try{ CalendarApp.getCalendarById(cfg.calendarId).getName(); }catch(e){ calendarOk = false; }
+
+  return {
+    name: cfg.name, tagline: cfg.tagline, lede: cfg.lede,
+    whatsapp: cfg.whatsapp, phone: cfg.phone, instagram: cfg.instagram,
+    address: cfg.address, mapLink: cfg.mapLink,
+    services: listServices_(), hours: listHours_(),
+    exceptions: listExceptions_().map(e => ({ ...e, dateLabel: formatDateLabel_(e.date) })),
+    sheetsOk, calendarOk,
+  };
+}
+
+function saveInfo_(body){
+  ['name','tagline','lede','whatsapp','phone','instagram','address','mapLink'].forEach(k => {
+    if(body[k] !== undefined) setConfigValue_(k, body[k]);
+  });
+  return { ok:true };
+}
+
+/* ============================================================
+   UTILITÁRIOS
+   ============================================================ */
+function deleteRowById_(sheetName, id){
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(sheetName);
+  const rows = sheet.getDataRange().getValues();
+  for(let i=1;i<rows.length;i++){
+    if(rows[i][0] === id){ sheet.deleteRow(i+1); return; }
+  }
+}
+function formatDate_(value){
+  if(value instanceof Date) return Utilities.formatDate(value, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  return String(value);
+}
+function formatDateLabel_(dateStr){
+  const d = new Date(`${dateStr}T00:00:00`);
+  return Utilities.formatDate(d, Session.getScriptTimeZone(), 'dd/MM (EEEE)');
+}
+function todayISO_(){
+  return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+}
+
+function computeOpenStatus_(hours, exceptions){
+  const now = new Date();
+  const dateStr = todayISO_();
+  const exception = exceptions.find(e => e.date === dateStr);
+  let open, close, closedToday = false;
+
+  if(exception){
+    if(exception.type === 'closed'){ closedToday = true; }
+    else{ open = exception.open; close = exception.close; }
+  }else{
+    const h = hours.find(x => x.weekday === now.getDay());
+    if(!h || !h.active){ closedToday = true; }
+    else{ open = h.open; close = h.close; }
+  }
+
+  if(!closedToday && open && close){
+    const [oh,om] = open.split(':').map(Number);
+    const [ch,cm] = close.split(':').map(Number);
+    const openTime = new Date(now); openTime.setHours(oh,om,0,0);
+    const closeTime = new Date(now); closeTime.setHours(ch,cm,0,0);
+    if(now >= openTime && now <= closeTime){
+      return { openNow:true, closesAt: close };
+    }
+    if(now < openTime){
+      return { openNow:false, opensAt: open, opensAtLabel: 'hoje' };
+    }
+  }
+
+  // Fechado — procura a próxima abertura nos próximos 7 dias
+  for(let i=1;i<=7;i++){
+    const d = new Date(now.getTime() + i*86400000);
+    const ds = Utilities.formatDate(d, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+    const exc = exceptions.find(e => e.date === ds);
+    if(exc){
+      if(exc.type === 'closed') continue;
+      return { openNow:false, opensAt: exc.open, opensAtLabel: formatDateLabel_(ds) };
+    }
+    const h = hours.find(x => x.weekday === d.getDay());
+    if(h && h.active){
+      return { openNow:false, opensAt: h.open, opensAtLabel: i===1 ? 'amanhã' : formatDateLabel_(ds) };
+    }
+  }
+  return { openNow:false };
+}
+
+function computeNextSlots_(services, hours){
+  const active = services.filter(s => s.active !== false);
+  if(!active.length) return { slots: [], dateLabel: '' };
+  const shortest = active.reduce((min,s) => s.duration < min.duration ? s : min, active[0]);
+
+  for(let i=0;i<7;i++){
+    const d = new Date(Date.now() + i*86400000);
+    const ds = Utilities.formatDate(d, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+    const avail = getAvailability_(ds, shortest.id);
+    if(!avail.closed && avail.slots && avail.slots.length){
+      const label = i===0 ? 'hoje' : (i===1 ? 'amanhã' : formatDateLabel_(ds));
+      return {
+        slots: avail.slots.slice(0,3).map(t => ({ time:t, dateLabel: label })),
+        dateLabel: label,
+      };
+    }
+  }
+  return { slots: [], dateLabel: '' };
+}

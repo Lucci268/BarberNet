@@ -9,4 +9,4 @@
    const APP_SCRIPT_URL = "https://script.google.com/macros/s/AKfycb.../exec";
    ============================================================ */
 
-const APP_SCRIPT_URL = "";
+const APP_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxhoxoZSSMgqomussah54uT5aPvAvDryVRerwAHOtmz9JYwrmJyAs8abLETiVp5e59oAQ/exec";
